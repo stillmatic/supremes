@@ -2,10 +2,12 @@
 Core data models.
 """
 
-from typing import List, Any, Dict, Optional
 import requests
 import rapidjson
-import helpers
+import pandas as pd
+from functools import total_ordering
+from typing import List, Any, Dict, Optional
+from helpers import load_from_remote
 
 
 class Case:
@@ -18,7 +20,8 @@ class Case:
         second_party: str,
         description: str,
         name: str,
-        advocates: List["Advocate"],
+        decisions: Optional[List["Decision"]] = None,
+        advocates: Optional[List["Advocate"]] = None,
         heard_by: Optional[List["Court"]] = None,
         decided_by: Optional[List["Court"]] = None,
         transcripts: Optional[List["Transcript"]] = None,
@@ -31,23 +34,66 @@ class Case:
         self.description = description
         self.name = name
 
+        self.decisions = decisions
         self.advocates = advocates
         self.heard_by = heard_by
         self.decided_by = decided_by
         self.transcripts = transcripts
 
-    @classmethod
-    def from_id(cls, term: int, docket_number: str) -> "Case":
-        url = f"https://api.oyez.org/cases/{term}/{docket_number}"
-        data = helpers.load_from_remote(url)
-        return cls.from_json(data)
+    def get_transcript_df(self, groupby=True) -> pd.DataFrame:
+        dfs = []
+        if not self.decisions:
+            return None
+        for decision in self.decisions:
+            if not decision.ballots:
+                return None
+            vote_df = pd.DataFrame(
+                [({"voter": x.voter, "vote": x.vote}) for x in decision.ballots]
+            )
+            if not self.transcripts:
+                joined_df = vote_df
+                joined_df["text"] = ""
+                joined_df.columns = ["speaker", "vote", "text"]
+                dfs.append(joined_df[["speaker", "text", "vote"]])
+            else:
+                for transcript in self.transcripts:
+                    speech_df = pd.DataFrame(
+                        [
+                            {"speaker": x.speaker, "text": x.text}
+                            for x in transcript.utterances
+                        ]
+                    )
+                    joined_df = speech_df.merge(
+                        vote_df, left_on="speaker", right_on="voter"
+                    )[["speaker", "text", "vote"]]
+                    dfs.append(joined_df)
+        df = pd.concat(dfs)
+        df["term"] = self.term
+        df["docket_number"] = self.docket_number
+        if groupby:
+            return (
+                df.groupby(["speaker", "term", "docket_number"])
+                .agg({"text": lambda x: " ".join(x), "vote": "first"})
+                .reset_index()
+            )
+        else:
+            return df[['speaker', 'term', 'docket_number', 'text', 'vote']]
 
     @classmethod
-    def from_json(cls, data: Any) -> "Case":
-        advocates = [Advocate.from_json(person) for person in data["advocates"]]
+    def from_id(cls, term: int, docket_number: str, verbose: bool = True) -> "Case":
+        url = f"https://api.oyez.org/cases/{term}/{docket_number}"
+        data = load_from_remote(url, verbose=verbose)
+        return cls.from_json(data, verbose)
+
+    @classmethod
+    def from_json(cls, data: Any, verbose: bool = True) -> "Case":
+        if data["advocates"]:
+            advocates = [Advocate.from_json(person) for person in data["advocates"]]
+        else:
+            advocates = None
         if data["oral_argument_audio"]:
             transcripts = [
-                Transcript.from_id(argument["id"])
+                Transcript.from_id(argument["id"], verbose=verbose)
                 for argument in data["oral_argument_audio"]
             ]
         else:
@@ -63,6 +109,20 @@ class Case:
         else:
             heard_by_courts = None
 
+        if data["decisions"]:
+            decisions = [
+                Decision.from_json(
+                    decision,
+                    data["first_party"],
+                    data["second_party"],
+                    data["first_party_label"],
+                    data["second_party_label"],
+                )
+                for decision in data["decisions"]
+            ]
+        else:
+            decisions = None
+
         return cls(
             data["term"],
             data["docket_number"],
@@ -71,6 +131,7 @@ class Case:
             data["second_party"],
             data["description"],
             data["name"],
+            decisions,
             advocates,
             heard_by_courts,
             decided_by_courts,
@@ -96,9 +157,9 @@ class Transcript:
         return f"https://api.oyez.org/case_media/oral_argument_audio/{self.id}"
 
     @classmethod
-    def from_id(cls, id: int) -> "Transcript":
+    def from_id(cls, id: int, verbose: bool = True) -> "Transcript":
         url = f"https://api.oyez.org/case_media/oral_argument_audio/{id}"
-        data = helpers.load_from_remote(url)
+        data = load_from_remote(url, verbose=verbose)
         return cls.from_json(data)
 
     @classmethod
@@ -106,16 +167,20 @@ class Transcript:
         utterances = []
         for section in data["transcript"]["sections"]:
             for turn in section["turns"]:
-                spk = turn["speaker"]
-                speaker = Person(
-                    spk["ID"], spk["name"], spk["last_name"], spk["identifier"]
-                )
+                try:
+                    spk = turn["speaker"]
+                    speaker = Person(
+                        spk["ID"], spk["name"], spk["last_name"], spk["identifier"]
+                    )
+                except Exception:
+                    speaker = None
                 text = " ".join([x["text"] for x in turn["text_blocks"]])
-                utterance = Utterance(speaker, text)
+                utterance = Utterance(speaker, text, turn["start"], turn["stop"])
                 utterances.append(utterance)
         return cls(data["id"], data["title"], utterances)
 
 
+@total_ordering
 class Person:
     def __init__(self, id: int, name: str, last_name: str, identifier: str) -> None:
         self.id = id
@@ -128,6 +193,22 @@ class Person:
 
     def __str__(self) -> str:
         return self.name
+
+    def __lt__(self, other) -> str:
+        return self.name.lower() < other.name.lower()
+
+    def __eq__(self, other) -> bool:
+        """
+        Assume two people are same if they have the same name.
+
+        This is not guaranteed to work but is probably okay for analysis now.
+        """
+        if not other:
+            return False
+        return self.name == other.name
+
+    def __hash__(self):
+        return hash(repr(self))
 
     def get_person_url(self) -> str:
         return f"https://api.oyez.org/people/{self.identifier}"
@@ -213,7 +294,7 @@ class Role:
         role_id: int,
         role_title: int,
         role_type: str,
-        appointing_president: str,
+        appointing_president: Optional[str],
         institution_name: str,
         date_end: int,
         date_start: int,
@@ -247,10 +328,86 @@ class Role:
 
 
 class Utterance:
-    def __init__(self, speaker: Person, text: str) -> None:
+    def __init__(
+        self, speaker: Person, text: str, start: Optional[int], end: Optional[int]
+    ) -> None:
         self.speaker = speaker
         self.text = text
+        self.start = start
+        self.end = end
 
     def __repr__(self) -> str:
-        return f"{self.speaker}: '{self.text}'"
+        return f"{self.speaker} ({self.start} to {self.end}): '{self.text}'"
 
+
+class Ballot:
+    def __init__(self, voter: "Person", vote: str):
+        self.voter = voter
+        self.vote = vote
+
+    def __repr__(self):
+        return f"{self.voter} voted with the {self.vote}."
+
+    @classmethod
+    def from_json(cls, data: Any) -> "Ballot":
+        voter = Justice.from_json(data["member"])
+        vote = data["vote"]
+        return cls(voter, vote)
+
+
+class Decision:
+    def __init__(
+        self,
+        ballots: Optional[List["Ballot"]],
+        winning_party: str,
+        decision_type: str,
+        first_party: str,
+        second_party: str,
+        first_party_label: str,
+        second_party_label: str,
+        majority_vote: int,
+        minority_vote: int,
+    ):
+        self.ballots = ballots
+        self.decision_type = decision_type
+        self.majority_vote = majority_vote
+        self.minority_vote = minority_vote
+        self.winning_party = None
+        self.winning_party_name = winning_party
+        if winning_party:
+            if winning_party in first_party:
+                self.winning_party = first_party_label
+            elif winning_party in second_party:
+                self.winning_party = second_party_label
+
+    @classmethod
+    def from_json(
+        cls,
+        data: Any,
+        first_party: str,
+        second_party: str,
+        first_party_label: str,
+        second_party_label: str,
+    ) -> "Decision":
+        ballots = None
+        winning_party = None
+
+        if data["votes"]:
+            ballots = [Ballot.from_json(ballot) for ballot in data["votes"]]
+        if data["winning_party"]:
+            winning_party = data["winning_party"]
+
+        return cls(
+            ballots,
+            winning_party,
+            data["decision_type"],
+            first_party,
+            second_party,
+            first_party_label,
+            second_party_label,
+            data["majority_vote"],
+            data["minority_vote"],
+        )
+
+    def __repr__(self) -> str:
+        return f"""{self.majority_vote} - {self.minority_vote} decision in favor of {self.winning_party} {self.winning_party_name}."""
