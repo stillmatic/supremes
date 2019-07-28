@@ -5,6 +5,7 @@ Core data models.
 from typing import List, Any, Dict, Optional
 import requests
 import rapidjson
+import helpers
 
 
 class Case:
@@ -38,7 +39,7 @@ class Case:
     @classmethod
     def from_id(cls, term: int, docket_number: str) -> "Case":
         url = f"https://api.oyez.org/cases/{term}/{docket_number}"
-        data = rapidjson.loads(requests.get(url).content)
+        data = helpers.load_from_remote(url)
         return cls.from_json(data)
 
     @classmethod
@@ -97,7 +98,7 @@ class Transcript:
     @classmethod
     def from_id(cls, id: int) -> "Transcript":
         url = f"https://api.oyez.org/case_media/oral_argument_audio/{id}"
-        data = rapidjson.loads(requests.get(url).content)
+        data = helpers.load_from_remote(url)
         return cls.from_json(data)
 
     @classmethod
@@ -229,7 +230,7 @@ class Role:
         return self.role_title
 
     def get_role_url(self):
-        return f"https://api.oyez.org/preson_role/{self.role_type}/{self.id}"
+        return f"https://api.oyez.org/preson_role/{self.role_type}/{self.role_id}"
 
     @classmethod
     def from_json(cls, data: Any) -> "Role":
